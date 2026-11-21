@@ -1,0 +1,161 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>GSPN Live View</title>
+<meta name="robots" content="noindex">
+<!-- 11-21 guest watch page (ChatGSPN guest_share.py). Static: holds no secrets. The link's key is in the #fragment,
+     which the browser never sends to any server. Signalling goes through a public MQTT broker, encrypted with that key;
+     the video comes straight from GSPN's server, peer-to-peer. -->
+<script src="https://cdn.jsdelivr.net/npm/mqtt@5.10.1/dist/mqtt.min.js"></script>
+<style>
+  :root { --bg: #0e1117; --card: #171b24; --text: #eef1f5; --muted: #9aa3b0; --accent: #e5484d; --border: #2a303c; }
+  @media (prefers-color-scheme: light) { :root:not([data-theme="dark"]) { --bg: #f4f5f7; --card: #fff; --text: #16191f; --muted: #5b6370; --border: #dde1e7; } }
+  * { box-sizing: border-box; }
+  html, body { margin: 0; background: var(--bg); color: var(--text); font: 15px/1.4 system-ui, -apple-system, "Segoe UI", sans-serif; }
+  main { max-width: 1100px; margin: 0 auto; padding: 12px 16px 24px; }
+  header { display: flex; align-items: center; gap: 10px; margin-bottom: 10px; }
+  header h1 { font-size: 1.05rem; margin: 0; flex: 1; }
+  .dot { width: 10px; height: 10px; border-radius: 50%; background: #7c838c; flex: none; }
+  .dot.on { background: var(--accent); box-shadow: 0 0 8px var(--accent); }
+  .stage { position: relative; background: #000; border-radius: 10px; overflow: hidden; aspect-ratio: 16 / 9; }
+  video { width: 100%; height: 100%; display: block; object-fit: contain; background: #000; }
+  .over { position: absolute; inset: 0; display: flex; align-items: center; justify-content: center; text-align: center;
+          padding: 16px; color: #fff; background: rgba(0,0,0,0.55); font-size: 0.95rem; }
+  .over[hidden] { display: none; }
+  .bar { display: flex; gap: 8px; align-items: center; flex-wrap: wrap; margin-top: 10px; color: var(--muted); font-size: 0.85rem; }
+  button { font: inherit; border: 1px solid var(--border); background: var(--card); color: var(--text); border-radius: 999px;
+           padding: 8px 14px; cursor: pointer; }
+  button.primary { background: var(--accent); border-color: var(--accent); color: #fff; }
+  .spacer { flex: 1; }
+</style>
+</head>
+<body>
+<main>
+  <header><span class="dot" id="dot"></span><h1 id="title">GSPN Live View</h1></header>
+  <div class="stage">
+    <video id="v" playsinline autoplay muted></video>
+    <div class="over" id="over">Connecting…</div>
+  </div>
+  <div class="bar">
+    <button class="primary" id="snd" hidden>🔊 Tap for sound</button>
+    <button id="full">⛶ Full screen</button>
+    <button id="again" hidden>↻ Reconnect</button>
+    <span class="spacer"></span>
+    <span id="info"></span>
+  </div>
+</main>
+<script>
+(() => {
+  const BROKER = 'wss://broker.hivemq.com:8884/mqtt', PREFIX = 'gspnshare/v1/';
+  const STUN = [{ urls: 'stun:stun.l.google.com:19302' }];
+  const $ = id => document.getElementById(id);
+  const v = $('v'), over = $('over');
+  const say = (t, live) => { over.textContent = t; over.hidden = !t; $('dot').classList.toggle('on', !!live); };
+  const [linkId, keyB64] = (location.hash.slice(1) || '').split('.');
+  if (!linkId || !keyB64) { say('This link is incomplete. Ask for a new one.'); return; }
+
+  const unb64 = s => Uint8Array.from(atob(s.replace(/-/g, '+').replace(/_/g, '/') + '='.repeat((4 - s.length % 4) % 4)), c => c.charCodeAt(0));
+  const b64 = u => btoa(String.fromCharCode(...u)).replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, '');
+  const aad = new TextEncoder().encode(linkId);
+  let keyP = crypto.subtle.importKey('raw', unb64(keyB64), 'AES-GCM', false, ['encrypt', 'decrypt']);
+  async function seal(obj) {
+    const iv = crypto.getRandomValues(new Uint8Array(12));
+    const ct = new Uint8Array(await crypto.subtle.encrypt({ name: 'AES-GCM', iv, additionalData: aad }, await keyP,
+                                                           new TextEncoder().encode(JSON.stringify(obj))));
+    const out = new Uint8Array(12 + ct.length); out.set(iv); out.set(ct, 12); return b64(out);
+  }
+  async function open(blob) {
+    try {
+      const raw = unb64(blob);
+      const pt = await crypto.subtle.decrypt({ name: 'AES-GCM', iv: raw.slice(0, 12), additionalData: aad }, await keyP, raw.slice(12));
+      return JSON.parse(new TextDecoder().decode(pt));
+    } catch (e) { return null; }
+  }
+
+  let pc = null, client = null, until = 0, tick = null;
+  function stop() {
+    try { if (pc) pc.close(); } catch (e) {}
+    try { if (client) client.end(true); } catch (e) {}
+    pc = null; client = null;
+  }
+
+  async function start() {
+    stop();
+    $('again').hidden = true;
+    say('Connecting…');
+    const viewer = b64(crypto.getRandomValues(new Uint8Array(9)));
+    pc = new RTCPeerConnection({ iceServers: STUN });
+    pc.addTransceiver('video', { direction: 'recvonly' });
+    pc.addTransceiver('audio', { direction: 'recvonly' });
+    pc.ontrack = e => { if (!v.srcObject) v.srcObject = e.streams[0] || new MediaStream([e.track]); else if (e.streams[0] !== v.srcObject) v.srcObject.addTrack(e.track); };
+    pc.onconnectionstatechange = () => {
+      const s = pc && pc.connectionState;
+      if (s === 'connected') { say('', true); $('snd').hidden = !v.muted; v.play().catch(() => {}); }
+      if (s === 'failed') { say('The video could not get through from this network. Try Wi-Fi or cellular, then Reconnect.'); $('again').hidden = false; }
+      if (s === 'disconnected' || s === 'closed') {
+        say(until && Date.now() / 1000 > until ? 'This link has expired.' : 'The stream stopped. It may have been turned off.');
+        $('again').hidden = false;
+      }
+    };
+    const offer = await pc.createOffer();
+    await pc.setLocalDescription(offer);
+    await new Promise(res => {                       // whole offer at once: the server takes one round trip
+      if (pc.iceGatheringState === 'complete') return res();
+      const t = setTimeout(res, 3000);
+      pc.addEventListener('icegatheringstatechange', () => { if (pc.iceGatheringState === 'complete') { clearTimeout(t); res(); } });
+    });
+    client = mqtt.connect(BROKER, { clientId: 'gspn-v-' + viewer, clean: true, connectTimeout: 10000, reconnectPeriod: 0 });
+    const answerTopic = PREFIX + linkId + '/answer/' + viewer;
+    let answered = false;
+    const giveUp = setTimeout(() => { if (!answered) { say('No answer from GSPN. The link may be off, or the server is down.'); $('again').hidden = false; stop(); } }, 25000);
+    client.on('error', () => { if (!answered) { say('Could not reach the signalling service. Check your connection, then Reconnect.'); $('again').hidden = false; } });
+    client.on('connect', async () => {
+      client.subscribe(answerTopic, { qos: 1 }, async () => {
+        client.publish(PREFIX + linkId + '/offer', await seal({ t: Date.now(), v: viewer, sdp: pc.localDescription.sdp }), { qos: 1 });
+        say('Waiting for GSPN…');
+      });
+    });
+    client.on('message', async (topic, payload) => {
+      if (topic !== answerTopic || answered) return;
+      const msg = await open(new TextDecoder().decode(payload));
+      if (!msg) return;
+      answered = true; clearTimeout(giveUp);
+      try { client.end(true); } catch (e) {}
+      client = null;
+      if (!msg.ok) { say(msg.error || 'GSPN said no.'); return; }
+      until = msg.until || 0;
+      if (msg.label) { $('title').textContent = 'GSPN Live View · ' + msg.label; document.title = msg.label + ' · GSPN Live View'; }
+      say('Starting video…');
+      await pc.setRemoteDescription({ type: 'answer', sdp: msg.sdp });
+      clearInterval(tick);
+      let lastBytes = -1, still = 0;
+      tick = setInterval(async () => {
+        // A cut-off (link revoked or expired) stops the packets long before ICE gives up: watch the bytes.
+        if (pc && pc.connectionState === 'connected') {
+          let bytes = 0;
+          try { (await pc.getStats()).forEach(r => { if (r.type === 'inbound-rtp') bytes += r.bytesReceived || 0; }); } catch (e) {}
+          still = bytes === lastBytes ? still + 1 : 0;
+          lastBytes = bytes;
+          if (still >= 4) {
+            say(until && Date.now() / 1000 > until ? 'This link has expired.' : 'The stream stopped. It may have been turned off.');
+            $('again').hidden = false;
+            try { pc.close(); } catch (e) {}
+          }
+        }
+        if (!until) return;
+        const left = until - Date.now() / 1000;
+        $('info').textContent = left > 0 ? 'Link open for ' + (left > 3600 ? Math.round(left / 3600) + ' h' : Math.ceil(left / 60) + ' min') : 'Link expired';
+      }, 1000);
+    });
+  }
+
+  $('snd').onclick = () => { v.muted = false; v.play().catch(() => {}); $('snd').hidden = true; };
+  $('full').onclick = () => { const el = v; (el.requestFullscreen || el.webkitEnterFullscreen || el.webkitRequestFullscreen || (() => {})).call(el); };
+  $('again').onclick = () => start();
+  start().catch(e => { say('Could not start: ' + (e && e.message || e)); $('again').hidden = false; });
+})();
+</script>
+</body>
+</html>
