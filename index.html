@@ -144,7 +144,7 @@
             try { pc.close(); } catch (e) {}
           }
         }
-        if (!until) return;
+        if (!until || until >= 4102444800) { $('info').textContent = ''; return; }   // permanent link: no countdown
         const left = until - Date.now() / 1000;
         $('info').textContent = left > 0 ? 'Link open for ' + (left > 3600 ? Math.round(left / 3600) + ' h' : Math.ceil(left / 60) + ' min') : 'Link expired';
       }, 1000);
